@@ -1,5 +1,11 @@
 # github-core-clone
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/bsnpg/github-core-clone/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/bsnpg/github-core-clone/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+Referral code: `26zqsqqz`
+
 A standalone GitHub-compatible git forge in one process, built for [make.fun's github-core-clone-01](https://make.fun/bounty/github-core-clone-01): a git smart-HTTP server, the REST v3 API, GraphQL v4, and an MCP endpoint, all over one in-memory store. No dependencies, no git binary, no outside service, no proxy — Node's standard library only.
 
 ## Run it
