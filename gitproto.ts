@@ -450,8 +450,8 @@ export function collectReachable(roots: readonly string[], lookup: ObjectLookup)
   const found = new Map<string, GitObject>();
   const queue: string[] = [...roots];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const object = lookup(oid);
@@ -475,8 +475,8 @@ export function collectCommits(roots: readonly string[], lookup: ObjectLookup): 
   const order: string[] = [];
   const seen = new Set<string>();
   const queue: string[] = [...roots];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const object = lookup(oid);
@@ -487,13 +487,21 @@ export function collectCommits(roots: readonly string[], lookup: ObjectLookup): 
   return order;
 }
 
-/** True when `ancestor` is reachable from `tip` (or equal to it). */
+/**
+ * True when `ancestor` is reachable from `tip` (or equal to it). The linear
+ * case — the tip's direct parent — is checked first with a single parse:
+ * every sequential push lands there, so the common path never walks history.
+ */
 export function isAncestor(ancestor: string, tip: string, lookup: ObjectLookup): boolean {
   if (ancestor === tip) return true;
-  const seen = new Set<string>();
-  const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  const tipObject = lookup(tip);
+  if (!tipObject || tipObject.type !== 'commit') return false;
+  const tipParents = parseCommit(tipObject.data).parents;
+  if (tipParents.includes(ancestor)) return true;
+  const seen = new Set<string>([tip]);
+  const queue: string[] = [...tipParents];
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     const object = lookup(oid);
@@ -512,8 +520,8 @@ export function mergeBase(a: string, b: string, lookup: ObjectLookup): string | 
   const ancestorsA = new Set<string>(collectCommits([a], lookup));
   const queue: string[] = [b];
   const seen = new Set<string>();
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
     if (ancestorsA.has(oid)) return oid;

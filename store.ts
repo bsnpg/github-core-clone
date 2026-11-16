@@ -61,6 +61,12 @@ export interface IssueRecord {
   createdAt: string;
   updatedAt: string;
   comments: CommentRecord[];
+  /**
+   * The REST single-issue JSON body, cached: the read workload asks for the
+   * same issue thousands of times and nothing about it changes between
+   * reads. Cleared by any mutation of the issue (PATCH, new comment).
+   */
+  viewJson: string | null;
 }
 
 export interface PullRecord {
@@ -97,6 +103,9 @@ export interface RepoRecord {
   pulls: PullRecord[];
   nextNumber: number;
   flatTreeCache: Map<string, Map<string, string>>;
+  /** Issues and pulls by number: the single-item reads are O(1), not a scan. */
+  issuesByNumber: Map<number, IssueRecord>;
+  pullsByNumber: Map<number, PullRecord>;
 }
 
 export function repoKey(owner: string, name: string): string {
@@ -173,6 +182,8 @@ export class Store {
       pulls: [],
       nextNumber: 1,
       flatTreeCache: new Map(),
+      issuesByNumber: new Map(),
+      pullsByNumber: new Map(),
     };
     // The stock labels every GitHub repository starts with.
     for (const [label, color] of [
@@ -497,13 +508,15 @@ export class Store {
       createdAt: TRIAL_NOW_ISO,
       updatedAt: TRIAL_NOW_ISO,
       comments: [],
+      viewJson: null,
     };
     repo.issues.push(issue);
+    repo.issuesByNumber.set(issue.number, issue);
     return issue;
   }
 
   getIssue(repo: RepoRecord, number: number): IssueRecord | undefined {
-    return repo.issues.find((issue) => issue.number === number);
+    return repo.issuesByNumber.get(number);
   }
 
   createPull(
@@ -534,11 +547,12 @@ export class Store {
       updatedAt: TRIAL_NOW_ISO,
     };
     repo.pulls.push(pull);
+    repo.pullsByNumber.set(pull.number, pull);
     return pull;
   }
 
   getPull(repo: RepoRecord, number: number): PullRecord | undefined {
-    return repo.pulls.find((pull) => pull.number === number);
+    return repo.pullsByNumber.get(number);
   }
 
   /** Squash-merge a pull request onto its base branch. Returns the merge commit sha or an error. */
@@ -573,6 +587,7 @@ export class Store {
       createdAt: TRIAL_NOW_ISO,
     };
     issue.comments.push(comment);
+    issue.viewJson = null;
     return comment;
   }
 

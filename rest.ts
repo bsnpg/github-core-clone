@@ -24,10 +24,16 @@ export interface RestResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
+  /** A pre-stringified JSON body: sent as-is, skipping a second stringify. */
+  raw?: string;
 }
 
 function ok(body: unknown, status = 200, headers?: Record<string, string>): RestResult {
   return { status, body, headers };
+}
+
+function okRaw(raw: string, status = 200, headers?: Record<string, string>): RestResult {
+  return { status, body: null, headers, raw };
 }
 
 function err(status: number, message: string): RestResult {
@@ -119,6 +125,14 @@ export function issueView(issue: IssueRecord, repo: RepoRecord): Record<string, 
     html_url: `https://example.invalid/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
   };
+}
+
+/** The single-issue JSON body, cached on the issue (see store.ts viewJson). */
+export function issueViewJson(issue: IssueRecord, repo: RepoRecord): string {
+  if (issue.viewJson !== null) return issue.viewJson;
+  const text = JSON.stringify(issueView(issue, repo));
+  issue.viewJson = text;
+  return text;
 }
 
 function pullView(pull: PullRecord, repo: RepoRecord, store: Store): Record<string, unknown> {
@@ -374,7 +388,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResult {
       }
       if (rest.length > 2) return err(404, 'Not Found');
       if (!issue) return err(404, 'Not Found');
-      if (ctx.method === 'GET') return ok(issueView(issue, repo));
+      if (ctx.method === 'GET') return okRaw(issueViewJson(issue, repo));
       if (ctx.method === 'PATCH') {
         if (isRecord(ctx.body)) {
           const state = stringField(ctx.body, 'state');
@@ -384,6 +398,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResult {
           const body = stringField(ctx.body, 'body');
           if (body !== undefined) issue.body = body;
           issue.updatedAt = TRIAL_NOW_ISO;
+          issue.viewJson = null;
         }
         return ok(issueView(issue, repo));
       }

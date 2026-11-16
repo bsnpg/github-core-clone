@@ -11,7 +11,6 @@ import {
   encodePktLine,
   encodePktLines,
   flattenTree,
-  hashObject,
   isAncestor,
   parseCommit,
   parseTagTarget,
@@ -208,10 +207,35 @@ function parseFetchArgs(packets: GitPacket[], v2: boolean): FetchArgs {
 
 interface FetchPlan {
   packObjects: GitObject[];
+  /** The pack objects' oids, in the same order as packObjects (the pack-cache key). */
+  packOids: string[];
   shallow: string[];
   unshallow: string[];
   wantedRefs: Array<{ oid: string; ref: string }>;
   acks: string[];
+}
+
+/**
+ * The pack bytes for one exact object set, shared across identical fetches.
+ * A pack holds only objects already in the store, and objects are never
+ * mutated or deleted, so a cached pack stays valid for the trial's life; the
+ * key is the repo plus the sorted object ids. Capped so a pathological
+ * trial cannot grow it without bound (oldest entries go first).
+ */
+const PACK_CACHE_MAX = 128;
+const packCache = new Map<string, Buffer>();
+
+function cachedPack(repoId: number, packOids: readonly string[], packObjects: readonly GitObject[]): Buffer {
+  const key = `${repoId}:${packOids.join(',')}`;
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
+  const pack = writePack(packObjects);
+  if (packCache.size >= PACK_CACHE_MAX) {
+    const oldest = packCache.keys().next().value;
+    if (oldest !== undefined) packCache.delete(oldest);
+  }
+  packCache.set(key, pack);
+  return pack;
 }
 
 /**
@@ -221,6 +245,16 @@ interface FetchPlan {
  */
 function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
   const lookup = (oid: string): GitObject | undefined => repo.objects.get(oid);
+  // One tree's reachable objects, memoised per plan: a full fetch walks one
+  // tree per commit, and the subtrees are shared between those trees.
+  const treeCache = new Map<string, Map<string, GitObject>>();
+  const treeObjects = (treeOid: string): Map<string, GitObject> => {
+    const hit = treeCache.get(treeOid);
+    if (hit !== undefined) return hit;
+    const found = collectReachable([treeOid], lookup);
+    treeCache.set(treeOid, found);
+    return found;
+  };
   // Commit distances from the wants (want = 1, its parent = 2, ...).
   const dist = new Map<string, number>();
   const queue: string[] = [];
@@ -230,7 +264,7 @@ function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
     const commit = repo.objects.get(commitOid);
     if (!commit || commit.type !== 'commit') return;
     const treeOid = parseCommit(commit.data).tree;
-    for (const [oid, object] of collectReachable([treeOid], lookup)) includedObjects.set(oid, object);
+    for (const [oid, object] of treeObjects(treeOid)) includedObjects.set(oid, object);
   };
   for (const want of args.wants) {
     const object = repo.objects.get(want);
@@ -256,8 +290,8 @@ function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
       includedObjects.set(want, object);
     }
   }
-  while (queue.length > 0) {
-    const oid = queue.shift() as string;
+  for (let head = 0; head < queue.length; head += 1) {
+    const oid = queue[head] as string;
     const d = dist.get(oid) as number;
     if (args.depth !== null && d > args.depth) continue;
     if (includedCommits.has(oid)) continue;
@@ -288,8 +322,8 @@ function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
   const held = new Set<string>();
   const heldQueue: string[] = [...args.haves];
   const heldSeen = new Set<string>();
-  while (heldQueue.length > 0) {
-    const oid = heldQueue.shift() as string;
+  for (let head = 0; head < heldQueue.length; head += 1) {
+    const oid = heldQueue[head] as string;
     if (heldSeen.has(oid)) continue;
     heldSeen.add(oid);
     const object = repo.objects.get(oid);
@@ -297,7 +331,7 @@ function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
     held.add(oid);
     if (object.type === 'commit') {
       const treeOid = parseCommit(object.data).tree;
-      for (const [treeOid2] of collectReachable([treeOid], lookup)) held.add(treeOid2);
+      for (const [treeOid2] of treeObjects(treeOid)) held.add(treeOid2);
       if (!args.shallow.includes(oid)) {
         for (const parent of parseCommit(object.data).parents) heldQueue.push(parent);
       }
@@ -305,21 +339,20 @@ function planFetch(repo: RepoRecord, args: FetchArgs): FetchPlan {
       held.add(parseTagTarget(object.data).object);
     }
   }
-  const packObjects: GitObject[] = [];
-  for (const [oid, object] of includedObjects) {
-    if (!held.has(oid)) packObjects.push(object);
-  }
-  packObjects.sort((a, b) => {
-    const ao = hashObject(a.type, a.data);
-    const bo = hashObject(b.type, b.data);
-    return ao < bo ? -1 : ao > bo ? 1 : 0;
-  });
+  // The pack's objects, sorted by their (already known) ids. Sorting by id
+  // used to re-hash every object on every comparison — O(n log n) SHA-1s
+  // per fetch — while the map keys already are the ids.
+  const packEntries = [...includedObjects.entries()].filter(([oid]) => !held.has(oid));
+  packEntries.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  const packOids = packEntries.map(([oid]) => oid);
+  const packObjects = packEntries.map(([, object]) => object);
   const wantedRefs: Array<{ oid: string; ref: string }> = [];
+  const refs = sortedRefs(repo);
   for (const want of args.wants) {
-    for (const ref of sortedRefs(repo)) if (ref.oid === want) wantedRefs.push({ oid: want, ref: ref.name });
+    for (const ref of refs) if (ref.oid === want) wantedRefs.push({ oid: want, ref: ref.name });
   }
   const acks = args.haves.filter((have) => repo.objects.has(have));
-  return { packObjects, shallow, unshallow, wantedRefs, acks };
+  return { packObjects, packOids, shallow, unshallow, wantedRefs, acks };
 }
 
 /** Wrap bytes in sideband band-1 packets (each at most 65520 bytes of framing). */
@@ -344,7 +377,7 @@ function sidebandPackets(pack: Buffer): Buffer[] {
 function handleFetchV2(repo: RepoRecord, packets: GitPacket[]): Buffer {
   const args = parseFetchArgs(packets, true);
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.packObjects);
+  const pack = cachedPack(repo.id, plan.packOids, plan.packObjects);
   const parts: Buffer[] = [];
   // The response shape depends on whether the client will negotiate further.
   // A `done` request is stateless (every HTTP fetch): the server answers the
@@ -380,7 +413,7 @@ function handleFetchV2(repo: RepoRecord, packets: GitPacket[]): Buffer {
 function handleFetchV0(repo: RepoRecord, packets: GitPacket[]): Buffer {
   const args = parseFetchArgs(packets, false);
   const plan = planFetch(repo, args);
-  const pack = writePack(plan.packObjects);
+  const pack = cachedPack(repo.id, plan.packOids, plan.packObjects);
   const parts: Buffer[] = [];
   if (plan.acks.length === 0) parts.push(encodePktLine('NAK\n'));
   else for (const ack of plan.acks) parts.push(encodePktLine(`ACK ${ack}\n`));

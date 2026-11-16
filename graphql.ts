@@ -931,6 +931,7 @@ class Executor {
       const decoded = this.store.decodeGlobalId(issueId);
       if (!decoded || decoded.kind !== 'issue') throw new GraphQLError('closeIssue: issue not found');
       decoded.issue.state = 'closed';
+      decoded.issue.viewJson = null;
       return this.executePayload(field, 'issue', { __type: 'issue', repo: decoded.repo, issue: decoded.issue });
     }
     if (field.name === 'createPullRequest') {

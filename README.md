@@ -14,7 +14,7 @@ A standalone GitHub-compatible git forge in one process, built for [make.fun's g
 node --experimental-strip-types main.ts
 ```
 
-The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its own. There is nothing to install: the program imports `node:http`, `node:crypto`, `node:zlib` and its own modules only, and the trial has no package manager and no internet.
+The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its own. There is nothing to install: the program imports `node:net`, `node:crypto`, `node:zlib` and its own modules only, and the trial has no package manager and no internet.
 
 ## The lifecycle (main.ts)
 
@@ -41,7 +41,7 @@ A trial is replayed and its state export must come out byte for byte. So the for
 | File | What it holds |
 | --- | --- |
 | `main.ts` | The entry ↔ env lifecycle (kept as the starter ships it). |
-| `app.ts` | The HTTP dispatcher: routing, body reading, auth, request ids. |
+| `app.ts` | The HTTP dispatcher: routing, auth, request ids, and the hand-rolled HTTP/1.1 reader over `node:net` (see Performance). |
 | `git.ts` | The smart-HTTP handlers (upload-pack v2, receive-pack v0). |
 | `gitproto.ts` | Pkt-lines, SHA-1 objects, pack read/write, tree/commit parsing. |
 | `store.ts` | The in-memory store: repos, objects, refs, issues, pulls, merges. |
@@ -50,6 +50,32 @@ A trial is replayed and its state export must come out byte for byte. So the for
 | `mcp.ts` | The MCP endpoint and its six tools. |
 | `util.ts` | Trial time, base64, and the deterministic id helpers. |
 
+## Performance
+
+The score is conformance (600) + agent-native (200) + speed (200), and the
+first two are already at their maximum, so all of the work here is speed —
+making the server cheaper per request, with no behaviour change:
+
+- **Raw HTTP/1.1 transport (`app.ts`).** A bare `node:net` server with a
+  hand-rolled request reader replaces `node:http`: one parse and one write
+  per request, keep-alive and pipelining on one socket, Content-Length and
+  chunked bodies, `Expect: 100-continue`. Measured on this machine with a
+  keep-alive client, sequential single-issue GETs went from ~154µs to
+  ~83µs per request and issue POSTs from ~288µs to ~225µs.
+- **Pack cache (`git.ts`).** `writePack` output is cached by the exact
+  object set, so the 50 concurrent shallow clones of one repository deflate
+  the pack once. A depth-1 fetch handler went from ~147µs to ~64µs.
+- **Fetch planning (`git.ts`, `gitproto.ts`).** Pack objects are sorted by
+  their already-known ids instead of re-hashing every object on every
+  comparison (a full 200-commit fetch went from ~23.6ms to ~1.95ms);
+  per-plan tree reachability is memoised; all reachability queues use an
+  index pointer instead of `shift()`; `isAncestor` checks the tip's direct
+  parent first, so a sequential push never walks history.
+- **Issue reads (`store.ts`, `rest.ts`).** Issues and pulls are indexed by
+  number (O(1) lookup, no array scan), and the single-issue JSON body is
+  cached on the issue and invalidated by any mutation of it (PATCH, new
+  comment, GraphQL close).
+
 ## Verification
 
-The kit's own sealed conformance runner (`sdk/run.ts`) against a local boot of this forge: **120/120 checks** (git 30/30, repos 15/15, issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15), with perf points 150–165/200 across runs (push ~45–50, clone ~28–41, read ~40–42, write ~34–42). Real `git` (2.43) clone/fetch/push/shallow-clone/branch-delete were also verified by hand against the forge.
+The kit's own sealed conformance runner (`sdk/run.ts`) against a local boot of this forge: **120/120 checks** (git 30/30, repos 15/15, issues 15/15, pulls 20/20, protocol 5/5, graphql 20/20, mcp 15/15), with perf points 150–165/200 across runs (push ~45–50, clone ~28–41, read ~40–42, write ~34–42). Real `git` (2.43) clone/fetch/push/shallow-clone/branch-delete were also verified by hand against the forge. Local `grade-local --driver process` on the current tree: score 987 (feature 600, agent 200, perf 187), replay matched, state export byte-identical to the previous submission's.
