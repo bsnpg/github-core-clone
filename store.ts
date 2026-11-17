@@ -62,11 +62,13 @@ export interface IssueRecord {
   updatedAt: string;
   comments: CommentRecord[];
   /**
-   * The REST single-issue JSON body, cached: the read workload asks for the
-   * same issue thousands of times and nothing about it changes between
-   * reads. Cleared by any mutation of the issue (PATCH, new comment).
+   * The REST single-issue JSON body, cached as bytes: the read workload asks
+   * for the same issue thousands of times and nothing about it changes
+   * between reads. Cleared by any mutation of the issue (PATCH, new comment,
+   * GraphQL closeIssue). The bytes are shared read-only — the dispatcher
+   * copies them into each response, never mutates them.
    */
-  viewJson: string | null;
+  viewBuf: Buffer | null;
 }
 
 export interface PullRecord {
@@ -329,10 +331,12 @@ export class Store {
 
   /** Build (and store) the tree for a flat path map; returns the root tree oid. */
   buildTreeFromFlat(repo: RepoRecord, flat: ReadonlyMap<string, string>): string {
-    // Group paths by directory, recursively.
+    // Group paths by directory, recursively. Only the directory names are
+    // collected here — the recursion re-scans the flat map by prefix, so
+    // building a per-directory sub-map would be work nobody reads.
     const build = (prefix: string): string => {
       const entries: { mode: string; name: string; oid: string }[] = [];
-      const dirs = new Map<string, Map<string, string>>();
+      const dirs = new Set<string>();
       for (const [path, oid] of flat) {
         if (prefix !== '' && !path.startsWith(`${prefix}/`)) continue;
         const rest = prefix === '' ? path : path.slice(prefix.length + 1);
@@ -340,18 +344,11 @@ export class Store {
         if (slash === -1) {
           entries.push({ mode: '100644', name: rest, oid });
         } else {
-          const dir = rest.slice(0, slash);
-          let sub = dirs.get(dir);
-          if (!sub) {
-            sub = new Map();
-            dirs.set(dir, sub);
-          }
-          sub.set(path, oid);
+          dirs.add(rest.slice(0, slash));
         }
       }
-      for (const [dir, sub] of dirs) {
+      for (const dir of dirs) {
         const subPrefix = prefix === '' ? dir : `${prefix}/${dir}`;
-        void sub;
         entries.push({ mode: '40000', name: dir, oid: build(subPrefix) });
       }
       const data = buildTree(entries);
@@ -431,18 +428,22 @@ export class Store {
     return changes;
   }
 
-  /** Whether merging `headSha` into `baseSha` conflicts (three-way, file granularity). */
-  mergeConflicts(repo: RepoRecord, baseSha: string, headSha: string): boolean {
+  /**
+   * Whether merging `headSha` into `baseSha` conflicts (three-way, file granularity).
+   * Callers that already walked the graph may hand in the merge base instead
+   * of paying for the walk again; `undefined` means "work it out here".
+   */
+  mergeConflicts(repo: RepoRecord, baseSha: string, headSha: string, ancestor?: string | null): boolean {
     const baseCommit = repo.objects.get(baseSha);
     const headCommit = repo.objects.get(headSha);
     if (!baseCommit || !headCommit || baseCommit.type !== 'commit' || headCommit.type !== 'commit') return true;
     const baseTree = parseCommit(baseCommit.data).tree;
     const headTree = parseCommit(headCommit.data).tree;
-    const ancestor = mergeBase(baseSha, headSha, this.lookup(repo));
-    const ancestorTree = ancestor === null ? EMPTY_TREE_OID : parseCommit(repo.objects.get(ancestor)?.data ?? Buffer.alloc(0)).tree;
+    const ancestorOid = ancestor === undefined ? mergeBase(baseSha, headSha, this.lookup(repo)) : ancestor;
+    const ancestorTree = ancestorOid === null ? EMPTY_TREE_OID : parseCommit(repo.objects.get(ancestorOid)?.data ?? Buffer.alloc(0)).tree;
     const baseFlat = this.flatTree(repo, baseTree);
     const headFlat = this.flatTree(repo, headTree);
-    const ancestorFlat = ancestor === null ? new Map<string, string>() : this.flatTree(repo, ancestorTree);
+    const ancestorFlat = ancestorOid === null ? new Map<string, string>() : this.flatTree(repo, ancestorTree);
     const paths = new Set([...baseFlat.keys(), ...headFlat.keys(), ...ancestorFlat.keys()]);
     for (const path of paths) {
       const a = ancestorFlat.get(path) ?? null;
@@ -457,18 +458,19 @@ export class Store {
 
   /**
    * The merged flat tree for a squash merge of `headSha` onto `baseSha`
-   * (null when it conflicts).
+   * (null when it conflicts). Takes an already-known merge base like
+   * mergeConflicts does, so one merge costs one graph walk, not three.
    */
-  mergedFlat(repo: RepoRecord, baseSha: string, headSha: string): Map<string, string> | null {
-    if (this.mergeConflicts(repo, baseSha, headSha)) return null;
+  mergedFlat(repo: RepoRecord, baseSha: string, headSha: string, ancestor?: string | null): Map<string, string> | null {
+    const ancestorOid = ancestor === undefined ? mergeBase(baseSha, headSha, this.lookup(repo)) : ancestor;
+    if (this.mergeConflicts(repo, baseSha, headSha, ancestorOid)) return null;
     const baseCommit = repo.objects.get(baseSha);
     const headCommit = repo.objects.get(headSha);
     if (!baseCommit || !headCommit) return null;
-    const ancestor = mergeBase(baseSha, headSha, this.lookup(repo));
-    const ancestorTree = ancestor === null ? EMPTY_TREE_OID : parseCommit(repo.objects.get(ancestor)?.data ?? Buffer.alloc(0)).tree;
+    const ancestorTree = ancestorOid === null ? EMPTY_TREE_OID : parseCommit(repo.objects.get(ancestorOid)?.data ?? Buffer.alloc(0)).tree;
     const baseFlat = new Map(this.flatTree(repo, parseCommit(baseCommit.data).tree));
     const headFlat = this.flatTree(repo, parseCommit(headCommit.data).tree);
-    const ancestorFlat = ancestor === null ? new Map<string, string>() : this.flatTree(repo, ancestorTree);
+    const ancestorFlat = ancestorOid === null ? new Map<string, string>() : this.flatTree(repo, ancestorTree);
     for (const [path, h] of headFlat) {
       const a = ancestorFlat.get(path) ?? null;
       if (h !== a) baseFlat.set(path, h);
@@ -508,7 +510,7 @@ export class Store {
       createdAt: TRIAL_NOW_ISO,
       updatedAt: TRIAL_NOW_ISO,
       comments: [],
-      viewJson: null,
+      viewBuf: null,
     };
     repo.issues.push(issue);
     repo.issuesByNumber.set(issue.number, issue);
@@ -562,8 +564,11 @@ export class Store {
     const baseTip = repo.refs.get(baseRefName);
     if (baseTip === undefined) return { error: 'Base branch does not exist', status: 422 };
     const headTip = repo.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
-    if (this.mergeConflicts(repo, baseTip, headTip)) return { error: 'Merge conflict', status: 405 };
-    const merged = this.mergedFlat(repo, baseTip, headTip);
+    // One graph walk for the whole merge: the base is found here and handed
+    // down, instead of mergeConflicts and mergedFlat each walking it again.
+    const ancestor = mergeBase(baseTip, headTip, this.lookup(repo));
+    if (this.mergeConflicts(repo, baseTip, headTip, ancestor)) return { error: 'Merge conflict', status: 405 };
+    const merged = this.mergedFlat(repo, baseTip, headTip, ancestor);
     if (merged === null) return { error: 'Merge conflict', status: 405 };
     const treeOid = this.buildTreeFromFlat(repo, merged);
     const ident = forgeIdent();
@@ -587,7 +592,7 @@ export class Store {
       createdAt: TRIAL_NOW_ISO,
     };
     issue.comments.push(comment);
-    issue.viewJson = null;
+    issue.viewBuf = null;
     return comment;
   }
 

@@ -6,6 +6,16 @@
 // epoch is used so a local run is reproducible too.
 
 import { createHash } from 'node:crypto';
+import * as nodeCrypto from 'node:crypto';
+
+// One-shot SHA-1 (Node 21.7 and later): a single call instead of building a
+// hash object, roughly ten times faster for the small inputs the forge hashes
+// (object ids, pack trailers). Older runtimes fall back to the streaming
+// form; the bytes are identical either way. The cast keeps this compiling
+// under any TypeScript version — the check below is a runtime one.
+type OneShotHash = (algorithm: string, data: Uint8Array, encoding?: string) => string | Buffer;
+const oneShotHash: OneShotHash | null =
+  (nodeCrypto as unknown as { hash?: OneShotHash }).hash ?? null;
 
 /** The trial's "now": an ISO string from MAKEFUN_TRIAL_NOW, else a fixed default. */
 export const TRIAL_NOW_ISO: string = (() => {
@@ -22,7 +32,17 @@ export const TRIAL_NOW_EPOCH: number = Math.floor(new Date(TRIAL_NOW_ISO).getTim
 
 /** SHA-1 hex of bytes. */
 export function sha1Hex(data: Uint8Array): string {
+  if (oneShotHash !== null) return oneShotHash('sha1', data, 'hex') as string;
   return createHash('sha1').update(data).digest('hex');
+}
+
+/** SHA-1 digest of bytes, as raw bytes (pack trailers). */
+export function sha1Digest(data: Uint8Array): Buffer {
+  // Note: one-shot hash without an encoding hands back a hex string on this
+  // runtime, not bytes, so ask for hex explicitly and decode it — still far
+  // cheaper than building a hash object for a 20-byte digest.
+  if (oneShotHash !== null) return Buffer.from(oneShotHash('sha1', data, 'hex') as string, 'hex');
+  return createHash('sha1').update(data).digest();
 }
 
 /** Standard base64 of UTF-8 text. */

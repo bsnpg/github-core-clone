@@ -1,5 +1,10 @@
 // How this entry talks to the grading environment.
 //
+// v3 rework (Nov 2026): the server behind this glue got a perf pass —
+// one-shot SHA-1, a byte-cached issue view, lazy per-request parsing, and a
+// single merge-base walk per merge. Nothing about this file's contract
+// changed; the grading still only looks at the server (app.ts).
+//
 // The environment hands us its address through MAKEFUN_ENV_URL and expects
 // three things from us, in order: a server listening on a port the kernel
 // chose, one POST announcing that port, and then patient polling until the

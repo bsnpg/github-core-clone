@@ -7,7 +7,7 @@
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
-import { sha1Hex, ZERO_OID } from './util.ts';
+import { sha1Digest, sha1Hex, ZERO_OID } from './util.ts';
 
 export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
 
@@ -24,6 +24,9 @@ const CODE_TYPES: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3,
 
 /** The SHA-1 of an object, exactly as git computes it: `sha1("<type> <size>\0" + bytes)`. */
 export function hashObject(type: GitObjectType, data: Uint8Array): string {
+  // Two updates on one hash object: measured faster than concatenating
+  // header and data into one buffer first (the copy costs more than the
+  // second update saves).
   const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
   return createHash('sha1').update(header).update(data).digest('hex');
 }
@@ -431,7 +434,7 @@ export function writePack(objects: readonly GitObject[]): Buffer {
     parts.push(deflateSync(object.data));
   }
   const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
+  const trailer = sha1Digest(body);
   return Buffer.concat([body, trailer]);
 }
 

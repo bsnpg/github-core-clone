@@ -69,9 +69,15 @@ function restResult(result: RestResult, requestId: string): DispatchResult {
   return {
     status: result.status,
     contentType: 'application/json',
-    body: Buffer.from(text, 'utf8'),
+    // A cached Buffer body is sent as-is; a string body is encoded once here.
+    body: typeof text === 'string' ? Buffer.from(text, 'utf8') : text,
     extraHeaders: { 'x-github-request-id': requestId, ...(result.headers ?? {}) },
   };
+}
+
+/** Decode a path segment only when it actually carries an escape. */
+function decodeSegment(value: string): string {
+  return value.includes('%') ? decodeURIComponent(value) : value;
 }
 
 function bearerToken(headers: Record<string, string>): string | null {
@@ -111,9 +117,13 @@ function dispatch(
   const pathname = rawPath.startsWith('http://') || rawPath.startsWith('https://')
     ? rawPath.slice(rawPath.indexOf('/', rawPath.indexOf('://') + 3))
     : rawPath;
-  const segments = pathname.split('/').filter((part) => part !== '');
-  const query = new URLSearchParams(queryString);
-  const baseUrl = `http://${headers.host ?? 'localhost'}`;
+  const segments: string[] = [];
+  for (const part of pathname.split('/')) if (part !== '') segments.push(part);
+  // The query string is parsed only on the routes that read it (REST and the
+  // git info/refs advertisement); health, MCP, GraphQL and the git POSTs
+  // never touch it, so building the parser on every request is pure waste.
+  let query: URLSearchParams | null = null;
+  const getQuery = (): URLSearchParams => (query ??= new URLSearchParams(queryString));
 
   if (method === 'GET' && pathname === '/healthz') {
     return jsonResult(200, { ok: true });
@@ -139,11 +149,14 @@ function dispatch(
   }
 
   if (segments[0] === 'api' && segments[1] === 'v3') {
+    // The base URL is only needed by REST handlers (Link headers), so it is
+    // built here, not on every request.
+    const baseUrl = `http://${headers.host ?? 'localhost'}`;
     if (method === 'GET' && segments.length === 2) {
       const result = handleRest(store, {
         method,
         segments: [],
-        query,
+        query: getQuery(),
         body: undefined,
         bodyPresent: false,
         authed: authed(headers),
@@ -165,7 +178,7 @@ function dispatch(
     const result = handleRest(store, {
       method,
       segments: segments.slice(2),
-      query,
+      query: getQuery(),
       body: parsed,
       bodyPresent,
       authed: authed(headers),
@@ -176,23 +189,23 @@ function dispatch(
 
   // Git smart HTTP: /{owner}/{repo}.git/...
   if (segments.length >= 2 && segments[1]?.endsWith('.git') === true) {
-    const owner = decodeURIComponent(segments[0] as string);
-    const repo = decodeURIComponent((segments[1] as string).slice(0, -'.git'.length));
+    const owner = decodeSegment(segments[0] as string);
+    const repo = decodeSegment((segments[1] as string).slice(0, -'.git'.length));
     const tail = segments.slice(2);
     if (method === 'GET' && tail.length === 2 && tail[0] === 'info' && tail[1] === 'refs') {
-      const service = query.get('service');
+      const service = getQuery().get('service');
       if (service === 'git-upload-pack' || service === 'git-receive-pack') {
-        const result = handleInfoRefs(store, { owner, repo, service, query, headers, body: Buffer.alloc(0) });
+        const result = handleInfoRefs(store, { owner, repo, service, query: getQuery(), headers, body: Buffer.alloc(0) });
         return bufferResult(result.status, result.body, result.contentType);
       }
       return jsonResult(400, { message: 'service is required' });
     }
     if (method === 'POST' && tail.length === 1 && tail[0] === 'git-upload-pack') {
-      const result = handleUploadPack(store, { owner, repo, service: 'git-upload-pack', query, headers, body });
+      const result = handleUploadPack(store, { owner, repo, service: 'git-upload-pack', query: getQuery(), headers, body });
       return bufferResult(result.status, result.body, result.contentType);
     }
     if (method === 'POST' && tail.length === 1 && tail[0] === 'git-receive-pack') {
-      const result = handleReceivePack(store, { owner, repo, service: 'git-receive-pack', query, headers, body });
+      const result = handleReceivePack(store, { owner, repo, service: 'git-receive-pack', query: getQuery(), headers, body });
       return bufferResult(result.status, result.body, result.contentType);
     }
     return jsonResult(404, { message: 'Not Found' });

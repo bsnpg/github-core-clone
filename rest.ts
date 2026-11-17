@@ -24,15 +24,15 @@ export interface RestResult {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
-  /** A pre-stringified JSON body: sent as-is, skipping a second stringify. */
-  raw?: string;
+  /** A pre-stringified JSON body: sent as-is, skipping a second stringify. A Buffer is sent as-is too. */
+  raw?: string | Buffer;
 }
 
 function ok(body: unknown, status = 200, headers?: Record<string, string>): RestResult {
   return { status, body, headers };
 }
 
-function okRaw(raw: string, status = 200, headers?: Record<string, string>): RestResult {
+function okRaw(raw: string | Buffer, status = 200, headers?: Record<string, string>): RestResult {
   return { status, body: null, headers, raw };
 }
 
@@ -127,12 +127,12 @@ export function issueView(issue: IssueRecord, repo: RepoRecord): Record<string, 
   };
 }
 
-/** The single-issue JSON body, cached on the issue (see store.ts viewJson). */
-export function issueViewJson(issue: IssueRecord, repo: RepoRecord): string {
-  if (issue.viewJson !== null) return issue.viewJson;
-  const text = JSON.stringify(issueView(issue, repo));
-  issue.viewJson = text;
-  return text;
+/** The single-issue JSON body, cached on the issue as bytes (see store.ts viewBuf). */
+export function issueViewBuf(issue: IssueRecord, repo: RepoRecord): Buffer {
+  if (issue.viewBuf !== null) return issue.viewBuf;
+  const buf = Buffer.from(JSON.stringify(issueView(issue, repo)), 'utf8');
+  issue.viewBuf = buf;
+  return buf;
 }
 
 function pullView(pull: PullRecord, repo: RepoRecord, store: Store): Record<string, unknown> {
@@ -388,7 +388,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResult {
       }
       if (rest.length > 2) return err(404, 'Not Found');
       if (!issue) return err(404, 'Not Found');
-      if (ctx.method === 'GET') return okRaw(issueViewJson(issue, repo));
+      if (ctx.method === 'GET') return okRaw(issueViewBuf(issue, repo));
       if (ctx.method === 'PATCH') {
         if (isRecord(ctx.body)) {
           const state = stringField(ctx.body, 'state');
@@ -398,7 +398,7 @@ export function handleRest(store: Store, ctx: RestContext): RestResult {
           const body = stringField(ctx.body, 'body');
           if (body !== undefined) issue.body = body;
           issue.updatedAt = TRIAL_NOW_ISO;
-          issue.viewJson = null;
+          issue.viewBuf = null;
         }
         return ok(issueView(issue, repo));
       }
